@@ -7,7 +7,7 @@ early stopping, LR scheduler, checkpointing, CSV metrics logging, automatic loss
 separate saving of test activations for later evaluation.
 
 Usage example:
-  python train_sae.py \
+  python sae_guided_completion/train_sae.py \
     --activations-file clip_activations.pt \
     --epochs 20 \
     --batch-size 4096 \
@@ -25,18 +25,23 @@ Usage example:
     --gamma 0.1
 """
 import argparse
-import os
 import datetime
+import os
+
+import matplotlib.pyplot as plt
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import pandas as pd
-import matplotlib.pyplot as plt
-from torch.utils.data import TensorDataset, DataLoader, random_split
+from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 
 
 class SparseAutoencoder(nn.Module):
+    """
+    A simple k-sparse autoencoder with linear encoder and decoder.
+    """
+
     def __init__(self, input_dim, latent_dim, k, normalize_decoder=True):
         super().__init__()
         self.input_dim = input_dim
@@ -47,8 +52,12 @@ class SparseAutoencoder(nn.Module):
         self.decoder = nn.Linear(latent_dim, input_dim, bias=False)
 
     def forward(self, x):
+        """
+        Forward pass: encode, apply top-k sparsity, then decode.
+        """
         z = self.encoder(x)
         if self.k < z.size(1):
+            # keep only top-k activations per sample
             vals, idx = torch.topk(z.abs(), self.k, dim=1)
             mask = torch.zeros_like(z, dtype=torch.bool)
             mask.scatter_(1, idx, True)
@@ -56,6 +65,9 @@ class SparseAutoencoder(nn.Module):
         return self.decoder(z)
 
     def normalize_decoder_weights(self):
+        """
+        Normalize decoder weights to unit norm column-wise if enabled.
+        """
         if not self.normalize_decoder:
             return
         with torch.no_grad():
@@ -64,160 +76,291 @@ class SparseAutoencoder(nn.Module):
             w.div_(norm + 1e-8)
 
 
-def train_epoch(model, loader, criterion, optimizer, device):
+def train_epoch(model, loader, loss_fn, optimizer, device):
+    """
+    Run one training epoch and return average loss.
+    """
     model.train()
-    running = 0.0
-    for (X,) in tqdm(loader, desc="  Train", leave=False):
-        X = X.to(device)
+    total_loss = 0.0
+    for (x_batch,) in tqdm(loader, desc="  Train", leave=False):
+        x_batch = x_batch.to(device)
         optimizer.zero_grad()
-        out = model(X)
-        loss = criterion(out, X)
+        output = model(x_batch)
+        loss = loss_fn(output, x_batch)
         loss.backward()
         optimizer.step()
         model.normalize_decoder_weights()
-        running += loss.item() * X.size(0)
-    return running / len(loader.dataset)
+        total_loss += loss.item() * x_batch.size(0)
+    return total_loss / len(loader.dataset)
 
 
-def eval_epoch(model, loader, criterion, device, tag):
+def eval_epoch(model, loader, loss_fn, device, tag):
+    """
+    Evaluate model on validation or test split.
+    """
     model.eval()
-    running = 0.0
+    total_loss = 0.0
     with torch.no_grad():
-        for (X,) in tqdm(loader, desc=f"  {tag}", leave=False):
-            X = X.to(device)
-            out = model(X)
-            running += criterion(out, X).item() * X.size(0)
-    return running / len(loader.dataset)
+        for (x_batch,) in tqdm(loader, desc=f"  {tag}", leave=False):
+            x_batch = x_batch.to(device)
+            output = model(x_batch)
+            total_loss += loss_fn(output, x_batch).item() * x_batch.size(0)
+    return total_loss / len(loader.dataset)
+
+
+def parse_args():
+    """
+    Parse command-line arguments.
+    """
+    parser = argparse.ArgumentParser(
+        description="Train SAE on CLIP activations"
+    )
+    parser.add_argument(
+        "--activations-file",
+        required=True,
+        help="Path to the .pt file containing activations",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=20,
+        help="Maximum number of training epochs",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=2048,
+        help="Batch size for training",
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        required=True,
+        help="Number of non-zero latent activations (sparsity level)",
+    )
+    parser.add_argument(
+        "--expansion-factor",
+        type=int,
+        required=True,
+        help="Multiplier for latent dimension relative to input dim",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for the optimizer",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to use (cpu, cuda, mps). Auto-detect if unset",
+    )
+    parser.add_argument(
+        "--val-split",
+        type=float,
+        default=0.1,
+        help="Fraction of data used for validation",
+    )
+    parser.add_argument(
+        "--test-split",
+        type=float,
+        default=0.1,
+        help="Fraction of data used for testing",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=5,
+        help="Early stopping patience on validation loss",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="sae_checkpoints",
+        help="Name of subdirectory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--metrics-file",
+        type=str,
+        default="metrics.csv",
+        help="Filename for recorded metrics CSV",
+    )
+    parser.add_argument(
+        "--scheduler",
+        choices=["none", "step"],
+        default="none",
+        help="Learning rate scheduler type",
+    )
+    parser.add_argument(
+        "--step-size",
+        type=int,
+        default=10,
+        help="Step size (epochs) for StepLR scheduler",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.1,
+        help="Learning rate decay factor for StepLR",
+    )
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train SAE on CLIP activations")
-    parser.add_argument("--activations-file", required=True)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=2048)
-    parser.add_argument("--k", type=int, required=True)
-    parser.add_argument("--expansion-factor", type=int, required=True)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--val-split", type=float, default=0.1)
-    parser.add_argument("--test-split", type=float, default=0.1)
-    parser.add_argument("--patience", type=int, default=5)
-    parser.add_argument("--checkpoint-dir", type=str, default="sae_checkpoints")
-    parser.add_argument("--metrics-file", type=str, default="metrics.csv")
-    parser.add_argument("--scheduler", choices=["none", "step"], default="none")
-    parser.add_argument("--step-size", type=int, default=10)
-    parser.add_argument("--gamma", type=float, default=0.1)
-    args = parser.parse_args()
+    # parse command-line arguments
+    args = parse_args()
 
-    # Device selection with fallback
+    # select computing device
     default_device = torch.device(
-        "cuda" if torch.cuda.is_available() else
-        ("mps" if torch.backends.mps.is_available() else "cpu")
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
+        else "cpu"
     )
     if args.device:
-        if args.device == "cuda" and not torch.cuda.is_available():
-            print("[WARN] CUDA requested but not available, falling back to default device.")
-            device = default_device
-        else:
+        try:
             device = torch.device(args.device)
+        except Exception:
+            print("[WARN] Invalid device, falling back to auto-detect")
+            device = default_device
     else:
         device = default_device
     print(f"[INFO] Using device: {device}")
 
-    # Load activations
-    acts = torch.load(args.activations_file, map_location="cpu", weights_only=True)
+    # load activations from file
+    acts = torch.load(
+        args.activations_file, map_location="cpu", weights_only=True
+    )
     if acts.ndim > 2:
-        D = acts.shape[-1]
-        acts = acts.view(-1, D)
-    N, D = acts.shape
-    print(f"[INFO] Loaded activations shape: {acts.shape}")
+        # flatten sequence dimension if present
+        acts = acts.view(-1, acts.shape[-1])
+    num_samples, input_dim = acts.shape
+    print(f"[INFO] Loaded activations with shape: {acts.shape}")
 
-    # Splits
+    # split dataset into train/val/test
     ds = TensorDataset(acts)
-    n_val  = int(N * args.val_split)
-    n_test = int(N * args.test_split)
-    n_train = N - n_val - n_test
+    n_val = int(num_samples * args.val_split)
+    n_test = int(num_samples * args.test_split)
+    n_train = num_samples - n_val - n_test
     train_ds, val_ds, test_ds = random_split(
-        ds, [n_train, n_val, n_test], generator=torch.Generator().manual_seed(42)
+        ds,
+        [n_train, n_val, n_test],
+        generator=torch.Generator().manual_seed(42),
     )
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size)
-    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size) if n_test>0 else None
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True
+    )
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size)
+    test_loader = (
+        DataLoader(test_ds, batch_size=args.batch_size) if n_test > 0 else None
+    )
 
-    # Prepare output dirs
-    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_root = os.path.join("training_data", ts)
+    # prepare output directories per run
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_root = os.path.join("training_data", timestamp)
     os.makedirs(out_root, exist_ok=True)
-    metrics_csv = os.path.join(out_root, args.metrics_file)
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    # Save test activations
-    if n_test>0:
-        # Extract raw test activations
-        indices = test_ds.indices if hasattr(test_ds, 'indices') else test_ds.dataset.indices
-        test_acts = acts[indices]
+    # checkpoints go under out_root/<checkpoint-dir>/
+    ckpt_root = os.path.join(out_root, args.checkpoint_dir)
+    os.makedirs(ckpt_root, exist_ok=True)
+
+    # save raw test activations for later use
+    if n_test > 0 and isinstance(test_ds, torch.utils.data.Subset):
+        indices = test_ds.indices
+        raw_test = acts[indices]
         test_path = os.path.join(out_root, "test_activations.pt")
-        torch.save(test_acts, test_path)
-        print(f"[INFO] Test activations saved to: {test_path}")
+        torch.save(raw_test, test_path)
+        print(f"[INFO] Saved test activations to: {test_path}")
 
-    # Model, optimizer, loss
-    latent_dim = args.expansion_factor * D
-    model = SparseAutoencoder(D, latent_dim, args.k).to(device)
+    # initialize model, optimizer, loss, scheduler
+    latent_dim = args.expansion_factor * input_dim
+    model = SparseAutoencoder(
+        input_dim, latent_dim, args.k, normalize_decoder=True
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
+    loss_fn = nn.MSELoss()
     scheduler = (
-        optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
-        if args.scheduler == "step" else None
+        optim.lr_scheduler.StepLR(
+            optimizer, step_size=args.step_size, gamma=args.gamma
+        )
+        if args.scheduler == "step"
+        else None
     )
 
-    # Training
-    best_val = float('inf')
-    no_impr = 0
-    records = []
+    # training loop with early stopping
+    best_val_loss = float("inf")
+    no_improve = 0
+    history = []
 
-    for epoch in range(1, args.epochs+1):
+    for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
-        tr_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        vl_loss = eval_epoch(model, val_loader, criterion, device, "Val")
-        if scheduler: scheduler.step()
-        print(f" ▶ train_loss={tr_loss:.4f}  val_loss={vl_loss:.4f}")
-        records.append({"epoch": epoch, "train_loss": tr_loss, "val_loss": vl_loss})
+        train_loss = train_epoch(
+            model, train_loader, loss_fn, optimizer, device
+        )
+        val_loss = eval_epoch(
+            model, val_loader, loss_fn, device, tag="Val"
+        )
+        if scheduler:
+            scheduler.step()
 
-        # Early stopping
-        if vl_loss < best_val:
-            best_val = vl_loss
-            no_impr = 0
-            ckpt = os.path.join(args.checkpoint_dir, f"sae_epoch{epoch}.pth")
-            torch.save(model.state_dict(), ckpt)
-            print(f"[INFO] Saved checkpoint: {ckpt}")
+        print(f" ▶ train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
+        history.append(
+            {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss}
+        )
+
+        # save best checkpoint
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            no_improve = 0
+            ckpt_path = os.path.join(ckpt_root, f"sae_epoch{epoch}.pth")
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"[INFO] Saved checkpoint: {ckpt_path}")
         else:
-            no_impr += 1
-            if no_impr >= args.patience:
-                print(f"[INFO] Early stopping after {no_impr} non-impr. epochs")
+            no_improve += 1
+            if no_improve >= args.patience:
+                print(
+                    f"[INFO] Early stopping after {no_improve}"
+                    " epochs without improvement"
+                )
                 break
 
-    # Final test
+    # final test evaluation
     if test_loader:
-        te_loss = eval_epoch(model, test_loader, criterion, device, "Test")
-        print(f"\nTest loss: {te_loss:.4f}")
-        records.append({"epoch": "test", "train_loss": None, "val_loss": te_loss})
+        test_loss = eval_epoch(
+            model, test_loader, loss_fn, device, tag="Test"
+        )
+        print(f"\nTest loss: {test_loss:.4f}")
+        history.append(
+            {"epoch": "test", "train_loss": None, "val_loss": test_loss}
+        )
 
-    # Save metrics and plot
-    df = pd.DataFrame(records)
-    df.to_csv(metrics_csv, index=False)
-    print(f"[INFO] Metrics saved to: {metrics_csv}")
+    # save metrics CSV
+    metrics_path = os.path.join(out_root, args.metrics_file)
+    df = pd.DataFrame(history)
+    df.to_csv(metrics_path, index=False)
+    print(f"[INFO] Metrics saved to: {metrics_path}")
 
-    plt.figure(figsize=(6,4))
-    epochs = df[df.epoch != 'test'].epoch.astype(int)
-    plt.plot(epochs, df.train_loss[:-1], label='train')
-    plt.plot(epochs, df.val_loss[:-1], label='val')
-    best_epoch = int(df.loc[df.val_loss[:-1].idxmin(), 'epoch'])
-    plt.axvline(best_epoch, linestyle='--', label='best epoch')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
+    # plot loss curve
+    epochs = [h["epoch"] for h in history if isinstance(h["epoch"], int)]
+    train_vals = [h["train_loss"] for h in history if isinstance(h["epoch"], int)]
+    val_vals = [h["val_loss"] for h in history if isinstance(h["epoch"], int)]
+    plt.figure(figsize=(6, 4))
+    plt.plot(epochs, train_vals, label="train")
+    plt.plot(epochs, val_vals, label="val")
+    best_epoch = int(
+        min(
+            (h for h in history if isinstance(h["epoch"], int)),
+            key=lambda x: x["val_loss"],
+        )["epoch"]
+    )
+    plt.axvline(best_epoch, linestyle="--", label="best epoch")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
     plt.legend()
     plt.tight_layout()
-    plot_path = os.path.join(out_root, 'loss_curve.png')
+    plot_path = os.path.join(out_root, "loss_curve.png")
     plt.savefig(plot_path)
     print(f"[INFO] Loss curve saved to: {plot_path}")
 
